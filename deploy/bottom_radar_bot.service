@@ -1,0 +1,18 @@
+[Unit]
+Description=bottom_radar Telegram interactive bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kyunghoon
+WorkingDirectory=/home/kyunghoon/bottom_radar
+EnvironmentFile=/home/kyunghoon/bottom_radar/.env
+ExecStart=/home/kyunghoon/bottom_radar/.venv/bin/python -m src.bot
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/home/kyunghoon/bottom_radar/bot.log
+StandardError=append:/home/kyunghoon/bottom_radar/bot.log
+
+[Install]
+WantedBy=multi-user.target
