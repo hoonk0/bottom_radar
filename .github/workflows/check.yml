@@ -1,0 +1,56 @@
+name: bottom_radar daily check
+
+on:
+  schedule:
+    # 07:00 KST = 22:00 UTC the previous calendar day
+    - cron: "0 22 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Run without sending Telegram (1 to enable)"
+        required: false
+        default: "0"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: bottom-radar
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run check
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_ERROR_CHAT_ID: ${{ secrets.TELEGRAM_ERROR_CHAT_ID }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || '0' }}
+        run: python -m src.main
+
+      - name: Commit state.json
+        if: ${{ github.event.inputs.dry_run != '1' }}
+        run: |
+          set -e
+          if [[ -z "$(git status --porcelain state.json)" ]]; then
+            echo "No state changes — skip commit"
+            exit 0
+          fi
+          git config user.name "bottom-radar-bot"
+          git config user.email "bottom-radar-bot@users.noreply.github.com"
+          git add state.json
+          git commit -m "chore(state): update state.json [skip ci]"
+          git push
