@@ -1,8 +1,8 @@
 {
-  "last_run": "2026-06-09T23:22:00.813286+00:00",
+  "last_run": "2026-06-10T23:40:35.996023+00:00",
   "last_sent_level": null,
   "last_sent_date": null,
-  "last_score": 0,
+  "last_score": 1,
   "history": [
     {
       "date": "2026-05-16",
@@ -187,6 +187,12 @@
     {
       "date": "2026-06-09",
       "score": 0,
+      "level": "normal",
+      "notified": false
+    },
+    {
+      "date": "2026-06-10",
+      "score": 1,
       "level": "normal",
       "notified": false
     }
