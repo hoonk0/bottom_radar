@@ -1,15 +1,9 @@
 {
-  "last_run": "2026-11-06T02:08:52.308146+00:00",
+  "last_run": "2026-11-07T01:44:45.102104+00:00",
   "last_sent_level": "notice",
   "last_sent_date": "2026-11-06",
-  "last_score": 5,
+  "last_score": 4,
   "history": [
-    {
-      "date": "2026-08-08",
-      "score": 0,
-      "level": "normal",
-      "notified": false
-    },
     {
       "date": "2026-08-09",
       "score": 0,
@@ -543,6 +537,12 @@
       "score": 5,
       "level": "notice",
       "notified": true
+    },
+    {
+      "date": "2026-11-07",
+      "score": 4,
+      "level": "notice",
+      "notified": false
     }
   ]
 }
