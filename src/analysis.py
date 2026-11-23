@@ -12,11 +12,14 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import List, Optional
 
+import numpy as np
 import pandas as pd
 import requests
 import yfinance as yf
 
 from src.fetchers.aaii import _cell_str, _download_bytes, _read_excel
+from src.indicators import score as score_mod
+from src.indicators.freshness import FRESHNESS_WINDOW
 from src.indicators.rsi import wilder_rsi
 
 
@@ -41,6 +44,8 @@ LABEL = {
     "fear_greed": "CNN F&G",
     "aaii": "AAII Bearish",
 }
+
+FG_EARLIEST_YEAR = 2021  # oldest start date the CNN F&G API accepts
 
 # AAII is weekly so cluster-gap is shorter.
 GAP_DAYS = {"vix": 10, "rsi": 10, "drawdown": 10, "fear_greed": 10, "aaii": 4}
@@ -118,8 +123,11 @@ def fetch_all(start_year: int, end_year: int, *, log=print) -> dict:
 
     log("  ↳ CNN F&G historical ...")
     try:
+        # Without a start date the API returns only ~1 year. With one it goes back to
+        # 2021-01-01 at most (earlier dates return HTTP 500).
+        fg_start = max(start_year - 1, FG_EARLIEST_YEAR)
         r = requests.get(
-            "https://production.dataviz.cnn.io/index/fearandgreed/graphdata",
+            f"https://production.dataviz.cnn.io/index/fearandgreed/graphdata/{fg_start}-01-01",
             headers={"User-Agent": UA}, timeout=20,
         )
         r.raise_for_status()
@@ -356,3 +364,113 @@ def format_indicator_report(indicator: str, reports: List[IndicatorReport], max_
 def resolve_indicator(name: str) -> Optional[str]:
     """Convert user-friendly indicator name to canonical key."""
     return INDICATOR_ALIASES.get(name.strip().lower().replace("&", "&"))
+
+
+# ----- Score frequency (how often each indicator reads +1/+2/+3) -----
+
+TRADING_DAYS_PER_YEAR = 252
+INDICATOR_ORDER = ["vix", "rsi", "drawdown", "fear_greed", "aaii"]
+
+# Human-readable thresholds as applied by src/indicators/score.py (inclusive bounds).
+SCORE_RULE_TEXT = {
+    "vix":        {1: "VIX ≥ 22",          2: "VIX ≥ 28",           3: "VIX ≥ 35"},
+    "rsi":        {1: "RSI ≤ 35",          2: "RSI ≤ 30",           3: "RSI ≤ 25"},
+    "drawdown":   {1: "고점 대비 ≤ -7%",   2: "고점 대비 ≤ -12%",   3: "고점 대비 ≤ -18%"},
+    "fear_greed": {1: "F&G ≤ 25",          2: "F&G ≤ 15",           3: "F&G ≤ 10"},
+    "aaii":       {1: "약세 응답 ≥ 40%",   2: "약세 응답 ≥ 45%",    3: "약세 응답 ≥ 50%"},
+}
+TOTAL_LEVEL_ORDER = [score_mod.NOTICE, score_mod.WATCH, score_mod.ALERT, score_mod.STRONG]
+
+
+def daily_scores(data: dict, start: str = "2008-01-01") -> pd.DataFrame:
+    """Replay the live scoring rules (src/indicators/score.py) on every SPY trading day.
+
+    Columns are indicator keys holding 0..3 (NaN where the source has no data).
+    AAII is weekly, so each day carries the latest survey, as the live bot sees it.
+    Drawdown includes the freshness decay."""
+    spy = data["spy"]
+    idx = spy.index[spy.index >= pd.Timestamp(start)]
+    series = build_indicator_series(data)
+
+    def on_days(s: pd.Series, ffill: bool = False) -> pd.Series:
+        if s.empty:
+            return pd.Series(np.nan, index=idx)
+        if ffill:
+            return s.reindex(s.index.union(spy.index)).ffill().reindex(idx)
+        return s.reindex(idx)
+
+    scorers = {
+        "vix": score_mod.score_vix,
+        "rsi": score_mod.score_rsi,
+        "fear_greed": score_mod.score_fear_greed,
+        "aaii": score_mod.score_aaii_bearish,
+    }
+    out = {}
+    for key, fn in scorers.items():
+        vals = on_days(series[key], ffill=(key == "aaii"))
+        out[key] = vals.map(lambda v: np.nan if pd.isna(v) else fn(v).score)
+
+    dsl = spy.rolling(FRESHNESS_WINDOW, min_periods=1).apply(
+        lambda w: len(w) - 1 - np.argmin(w), raw=True
+    )
+    dd = on_days(series["drawdown"])
+    out["drawdown"] = pd.Series(
+        [np.nan if pd.isna(v) else score_mod.score_drawdown(v, int(dsl[d])).score
+         for d, v in dd.items()],
+        index=idx,
+    )
+    return pd.DataFrame(out)[INDICATOR_ORDER]
+
+
+def _per_year(count: int, n_days: int) -> float:
+    return count / n_days * TRADING_DAYS_PER_YEAR if n_days else 0.0
+
+
+def format_frequency_report(scores: pd.DataFrame) -> str:
+    lines = [
+        "📊 *지표별 점수 빈도* — 1년(약 252거래일) 중 평균 며칠",
+        "_각 기준을 넘은 날 수 (예: RSI ≤ 30 은 25 이하인 날도 포함)_",
+        "",
+    ]
+    for key in INDICATOR_ORDER:
+        col = scores[key].dropna()
+        if col.empty:
+            lines.append(f"⚠️ {LABEL[key]}: 데이터 없음")
+            continue
+        n = len(col)
+        # Cumulative: "RSI ≤ 30" counts every day at +2 or +3, matching how the
+        # threshold reads.
+        per = {lv: _per_year(int((col >= lv).sum()), n) for lv in (1, 2, 3)}
+        any_pct = (col > 0).mean() * 100
+        lines.append(
+            f"*{LABEL[key]}* ({col.index[0].year}~, {n / TRADING_DAYS_PER_YEAR:.1f}년, "
+            f"점수 있는 날 {any_pct:.0f}%)"
+        )
+        for lv in (1, 2, 3):
+            lines.append(f"   +{lv} {SCORE_RULE_TEXT[key][lv]} → 연 {per[lv]:.0f}일")
+        if key == "drawdown":
+            lines.append("   _(신선도 감점 반영 후 점수 기준)_")
+        lines.append("")
+
+    # Total level — only over days where all five indicators have data.
+    full = scores.dropna()
+    if not full.empty:
+        n = len(full)
+        total = full.sum(axis=1).astype(int)
+        strong_sub = (full == 3).any(axis=1)
+        levels = [score_mod.determine_level(t, s) for t, s in zip(total, strong_sub)]
+        counts = pd.Series(levels).value_counts()
+        lines += [
+            f"*합산 단계* ({full.index[0].year}~, {n / TRADING_DAYS_PER_YEAR:.1f}년, 5개 지표 모두 있는 기간)",
+        ]
+        for lv in TOTAL_LEVEL_ORDER:
+            days = _per_year(int(counts.get(lv, 0)), n)
+            lines.append(
+                f"   {score_mod.LEVEL_EMOJI[lv]} {score_mod.LEVEL_LABEL_KO[lv]}({lv.upper()}): {days:.0f}일"
+            )
+
+    lines += [
+        "",
+        "_알람 횟수가 아니라 해당 점수였던 날 수예요. 알람은 7거래일 쿨다운이 있어 훨씬 적게 옵니다._",
+    ]
+    return "\n".join(lines)
