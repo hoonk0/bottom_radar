@@ -14,18 +14,21 @@ Run:
   set -a && source .env && set +a
   python -m src.bot
 
-The bot replies only to messages from TELEGRAM_CHAT_ID (yourself). All other senders
-are silently ignored.
+Access control: TELEGRAM_CHAT_ID is the owner. Other chats must be allowed by the owner
+with /allow <chat_id> (stored in allowed_users.json). Unknown senders get their chat id
+back and the owner is notified once per sender. Owner-only commands:
+  /allow ID [NAME]  /deny ID  /users
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
 import time
 import traceback
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 from zoneinfo import ZoneInfo
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -55,6 +58,12 @@ logger = get_logger("bot")
 KST = ZoneInfo("Asia/Seoul")
 
 API_BASE = "https://api.telegram.org/bot{token}"
+ALLOWED_PATH = ROOT / "allowed_users.json"
+
+# Cache lifetimes. The history fetch is 18 years of SPY/VIX/F&G/AAII and is slow on
+# the Pi, and Yahoo may throttle repeated pulls when several users ask in a row.
+HISTORY_TTL_SEC = 6 * 3600
+STATUS_TTL_SEC = 10 * 60
 
 HELP_TEXT = """🤖 *bottom_radar 명령어*
 
@@ -66,6 +75,7 @@ HELP_TEXT = """🤖 *bottom_radar 명령어*
 `/indicator vix` — 지표 전체 역사 강력 발화
    사용 가능: vix · rsi · drawdown · fear\\_greed · aaii
 `/about` — 봇 소개
+`/myid` — 내 채팅 ID 확인
 
 *지표 한 줄 요약* (각 0~3점, 합산 15점 만점)
 · VIX — 공포지수. 높을수록 패닉
@@ -135,9 +145,11 @@ def get_updates(token: str, offset: Optional[int], timeout: int = 30) -> dict:
     return r.json()
 
 
-def send(token: str, chat_id: str, text: str, parse_mode: str = "Markdown") -> dict:
+def send(token: str, chat_id: str, text: str, parse_mode: Optional[str] = "Markdown") -> dict:
     url = f"{API_BASE.format(token=token)}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode}
+    payload = {"chat_id": chat_id, "text": text}
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
     r = requests.post(url, json=payload, timeout=20)
     if not r.ok:
         # Markdown parsing can fail on special chars — retry as plain text once.
@@ -167,11 +179,86 @@ def set_commands(token: str) -> None:
     r.raise_for_status()
 
 
+# ------------------------ Cache ------------------------
+
+_cache: dict = {}
+
+
+def cached(key: str, ttl_sec: int, compute: Callable):
+    hit = _cache.get(key)
+    if hit and time.time() - hit[0] < ttl_sec:
+        return hit[1]
+    value = compute()
+    _cache[key] = (time.time(), value)
+    return value
+
+
+def history() -> dict:
+    """Full 2008→now history, shared by /year, /indicator and /freq."""
+    return cached(
+        "history", HISTORY_TTL_SEC,
+        lambda: fetch_all(2008, datetime.now().year, log=lambda *_: None),
+    )
+
+
+# ------------------------ Access control ------------------------
+
+def load_allowed() -> dict:
+    """{chat_id: name} of users the owner has allowed."""
+    try:
+        return json.loads(ALLOWED_PATH.read_text())
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        logger.exception("could not read %s", ALLOWED_PATH)
+        return {}
+
+
+def save_allowed(allowed: dict) -> None:
+    ALLOWED_PATH.write_text(json.dumps(allowed, indent=2, ensure_ascii=False) + "\n")
+
+
+def cmd_allow(args: list[str]) -> str:
+    if not args or not args[0].lstrip("-").isdigit():
+        return "사용법: `/allow 123456789 이름`"
+    allowed = load_allowed()
+    allowed[args[0]] = " ".join(args[1:]) or allowed.get(args[0], "")
+    save_allowed(allowed)
+    return f"✅ {args[0]} 허용됨 (총 {len(allowed)}명)"
+
+
+def cmd_deny(args: list[str]) -> str:
+    if not args:
+        return "사용법: `/deny 123456789`"
+    allowed = load_allowed()
+    if allowed.pop(args[0], None) is None:
+        return f"⚠️ {args[0]} 는 목록에 없어요"
+    save_allowed(allowed)
+    return f"🚫 {args[0]} 제거됨 (총 {len(allowed)}명)"
+
+
+def cmd_users(_args) -> str:
+    allowed = load_allowed()
+    if not allowed:
+        return "허용된 사용자 없음 (나만 사용 중)"
+    lines = [f"👥 허용된 사용자 {len(allowed)}명"]
+    lines += [f"· {cid} {name}" for cid, name in allowed.items()]
+    return "\n".join(lines)
+
+
+def _sender_name(msg: dict) -> str:
+    u = msg.get("from", {})
+    name = " ".join(x for x in (u.get("first_name"), u.get("last_name")) if x)
+    if u.get("username"):
+        name += f" (@{u['username']})"
+    return name or "이름 없음"
+
+
 # ------------------------ Command handlers ------------------------
 
 def cmd_status(_args) -> str:
     try:
-        result = run_pipeline()
+        result = cached("status", STATUS_TTL_SEC, run_pipeline)
     except Exception as e:
         logger.exception("status pipeline failed")
         return f"⚠️ 파이프라인 에러: {e}"
@@ -213,7 +300,7 @@ def cmd_year(args: list[str]) -> str:
             return f"⚠️ 지원 범위 2008 ~ {now_year} 입니다 ({y} 제외됨)"
 
     logger.info("/year %s", years)
-    data = fetch_all(min(years), max(years), log=lambda *_: None)
+    data = history()
     series = build_indicator_series(data)
 
     chunks = []
@@ -233,8 +320,7 @@ def cmd_indicator(args: list[str]) -> str:
         return f"⚠️ 알 수 없는 지표 '{args[0]}'.\n가능: {valid}"
     logger.info("/indicator %s", key)
 
-    end_year = datetime.now().year
-    data = fetch_all(2008, end_year, log=lambda *_: None)
+    data = history()
     series = build_indicator_series(data)
     reports = analyze_indicator(key, data, series, levels=[3])
     return format_indicator_report(key, reports, max_rows=15)
@@ -242,11 +328,10 @@ def cmd_indicator(args: list[str]) -> str:
 
 def cmd_freq(_args) -> str:
     logger.info("/freq")
-    data = fetch_all(2008, datetime.now().year, log=lambda *_: None)
-    return format_frequency_report(daily_scores(data))
+    return cached("freq", HISTORY_TTL_SEC, lambda: format_frequency_report(daily_scores(history())))
 
 
-def handle_command(text: str) -> Optional[str]:
+def handle_command(text: str, is_owner: bool = False, chat_id: str = "") -> Optional[str]:
     """Parse `/cmd args...` and return a Markdown reply (or None to ignore)."""
     parts = text.strip().split()
     if not parts or not parts[0].startswith("/"):
@@ -257,6 +342,14 @@ def handle_command(text: str) -> Optional[str]:
 
     if cmd in ("help", "start"):
         return HELP_TEXT
+    if cmd == "myid":
+        return f"내 채팅 ID: `{chat_id}`"
+    if is_owner and cmd == "allow":
+        return cmd_allow(args)
+    if is_owner and cmd == "deny":
+        return cmd_deny(args)
+    if is_owner and cmd == "users":
+        return cmd_users(args)
     if cmd == "about":
         return ABOUT_TEXT
     if cmd == "guide":
@@ -282,7 +375,8 @@ def main() -> int:
         return 1
 
     offset = None
-    logger.info("bot starting — listening for commands from chat_id=%s", chat_id)
+    logger.info("bot starting — owner chat_id=%s, allowed=%d", chat_id, len(load_allowed()))
+    requested: set[str] = set()  # unknown senders already reported to the owner
     try:
         set_commands(token)
     except Exception:
@@ -305,23 +399,34 @@ def main() -> int:
                 text = msg.get("text", "")
                 sender_chat = msg.get("chat", {}).get("id")
 
-                # Authorization: only respond to the configured chat_id.
-                if str(sender_chat) != str(chat_id):
-                    logger.warning("ignoring chat_id=%s text=%r", sender_chat, text)
-                    continue
-
                 if not text or not text.startswith("/"):
                     continue
+                sender = str(sender_chat)
+                is_owner = sender == str(chat_id)
 
-                logger.info("command from owner: %s", text)
+                if not is_owner and sender not in load_allowed():
+                    logger.warning("unauthorized chat_id=%s text=%r", sender, text)
+                    try:
+                        send(token, sender,
+                             f"🔒 아직 사용 권한이 없어요.\n관리자에게 요청이 전달됐어요.\n내 채팅 ID: {sender}", None)
+                        if sender not in requested:
+                            requested.add(sender)
+                            send(token, chat_id,
+                                 f"🙋 사용 요청: {_sender_name(msg)}\nID: {sender}\n"
+                                 f"허용하려면: /allow {sender} 이름", None)
+                    except Exception:
+                        logger.exception("unauthorized reply failed")
+                    continue
+
+                logger.info("command from %s: %s", "owner" if is_owner else sender, text)
                 try:
-                    reply = handle_command(text)
+                    reply = handle_command(text, is_owner=is_owner, chat_id=sender)
                 except Exception as e:
                     logger.exception("command crashed")
-                    reply = f"⚠️ 처리 중 에러: {e}\n```\n{traceback.format_exc()[-500:]}\n```"
+                    reply = f"⚠️ 처리 중 에러: {e}"
                 if reply:
                     try:
-                        send(token, chat_id, reply, "Markdown")
+                        send(token, sender, reply, "Markdown")
                     except Exception:
                         logger.exception("reply send failed")
         except requests.exceptions.RequestException as e:

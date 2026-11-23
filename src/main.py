@@ -23,8 +23,11 @@ logger = get_logger()
 
 def main() -> int:
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
-    error_chat_id = os.environ.get("TELEGRAM_ERROR_CHAT_ID", chat_id)
+    # TELEGRAM_CHAT_ID may list several targets, e.g. "@my_channel,123456789".
+    chat_ids = [c.strip() for c in os.environ.get("TELEGRAM_CHAT_ID", "").split(",") if c.strip()]
+    # Errors go to a personal chat, never to a channel ("@name" or "-100..." ids).
+    personal = [c for c in chat_ids if not c.startswith(("@", "-100"))]
+    error_chat_id = os.environ.get("TELEGRAM_ERROR_CHAT_ID") or (personal[0] if personal else "")
     dry_run = os.environ.get("DRY_RUN") == "1"
     today_utc = datetime.now(timezone.utc)
     today_kst = today_utc.astimezone(KST)
@@ -65,17 +68,20 @@ def main() -> int:
         logger.info("--- message preview ---\n%s\n-----------------------", message)
         if dry_run:
             logger.info("DRY_RUN=1 set — skipping telegram send")
-        elif not token or not chat_id:
+        elif not token or not chat_ids:
             logger.warning("missing TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID — skipping send")
         else:
-            try:
-                send_telegram(token, chat_id, message)
-                sent = True
-                logger.info("telegram message sent")
-            except Exception as e:
-                logger.exception("telegram send failed")
-                send_error(token, error_chat_id,
-                           f"telegram send failed — will retry next run: {e}")
+            # Counts as sent if any target got it; retrying would duplicate it for the rest.
+            for cid in chat_ids:
+                try:
+                    send_telegram(token, cid, message)
+                    sent = True
+                    logger.info("telegram message sent to %s", cid)
+                except Exception as e:
+                    logger.exception("telegram send to %s failed", cid)
+                    send_error(token, error_chat_id, f"telegram send to {cid} failed: {e}")
+            if not sent:
+                send_error(token, error_chat_id, "telegram send failed everywhere — will retry next run")
 
     # Partial failures only show up inside an alert message, so on quiet days a
     # broken source would go unnoticed. Report them separately.

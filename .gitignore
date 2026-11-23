@@ -13,3 +13,4 @@ htmlcov/
 .vscode/
 .claude/
 !data/aaii_sentiment.xls
+allowed_users.json
