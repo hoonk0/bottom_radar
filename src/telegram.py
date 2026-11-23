@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+import time
 from typing import List, Optional
 
 import requests
@@ -49,10 +50,18 @@ HIST_NOTE_BY_LEVEL = {
 }
 
 
+def _md_escape(text: str) -> str:
+    """Escape Telegram legacy-Markdown special chars in free text (error messages,
+    indicator keys) so a stray `_` or `*` can't make the whole message unparseable."""
+    for ch in ("_", "*", "`", "["):
+        text = text.replace(ch, "\\" + ch)
+    return text
+
+
 def _fmt_sub(s: SubScore) -> str:
     emoji = LEVEL_EMOJI[s.level]
     if s.error:
-        return f"⚠️ {s.label}: 조회 실패 ({s.error})"
+        return f"⚠️ {s.label}: 조회 실패 ({_md_escape(s.error)})"
     label_ko = LEVEL_LABEL_KO[s.level]
     if s.level == NORMAL:
         return f"{emoji} {s.label}: {s.display} (정상)"
@@ -91,21 +100,41 @@ def format_message(
 
     if total.failed_fetches:
         lines.append("")
-        lines.append(f"_⚠️ 일부 지표 조회 실패: {', '.join(total.failed_fetches)}_")
+        # No italics here: entity markers can't be escaped inside an entity, and keys
+        # like `fear_greed` contain underscores.
+        lines.append(f"⚠️ 일부 지표 조회 실패: {_md_escape(', '.join(total.failed_fetches))}")
 
     return "\n".join(lines)
 
 
-def send_telegram(token: str, chat_id: str, text: str, parse_mode: str = "Markdown") -> dict:
+def send_telegram(
+    token: str,
+    chat_id: str,
+    text: str,
+    parse_mode: str = "Markdown",
+    attempts: int = 3,
+    backoff_sec: float = 5.0,
+) -> dict:
+    """Send with retries. Network errors / 5xx / 429 are retried with backoff. A 400
+    (usually a Markdown parse error) is retried immediately as plain text so the alert
+    still goes out, just without formatting. Raises if every attempt fails."""
     if not token or not chat_id:
         raise RuntimeError("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID")
-    r = requests.post(
-        API_BASE.format(token=token),
-        json={"chat_id": chat_id, "text": text, "parse_mode": parse_mode},
-        timeout=15,
-    )
-    r.raise_for_status()
-    return r.json()
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode}
+    last_err: Optional[Exception] = None
+    for i in range(attempts):
+        try:
+            r = requests.post(API_BASE.format(token=token), json=payload, timeout=15)
+            if r.status_code == 400 and "parse_mode" in payload:
+                payload.pop("parse_mode")
+                r = requests.post(API_BASE.format(token=token), json=payload, timeout=15)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            last_err = e
+            if i < attempts - 1:
+                time.sleep(backoff_sec * (i + 1))
+    raise RuntimeError(f"telegram send failed after {attempts} attempts: {last_err}")
 
 
 def send_error(token: str, chat_id: str, message: str) -> None:

@@ -57,6 +57,9 @@ def main() -> int:
     notify, reason = should_notify(state, total.level, total.has_strong_sub, today=today_utc)
     logger.info("notify decision: %s — %s", notify, reason)
 
+    # Only a confirmed send counts as notified. Otherwise the cooldown would swallow
+    # the alert and the next run would not retry it.
+    sent = False
     if total.notify and notify:
         message = format_message(total, today_kst, snapshots=result.snapshots)
         logger.info("--- message preview ---\n%s\n-----------------------", message)
@@ -67,14 +70,21 @@ def main() -> int:
         else:
             try:
                 send_telegram(token, chat_id, message)
+                sent = True
                 logger.info("telegram message sent")
             except Exception as e:
                 logger.exception("telegram send failed")
-                send_error(token, error_chat_id, f"telegram send failed: {e}")
+                send_error(token, error_chat_id,
+                           f"telegram send failed — will retry next run: {e}")
 
-        update_state(state, today=today_utc, score=total.total, level=total.level, notified=True)
-    else:
-        update_state(state, today=today_utc, score=total.total, level=total.level, notified=False)
+    # Partial failures only show up inside an alert message, so on quiet days a
+    # broken source would go unnoticed. Report them separately.
+    if total.failed_fetches and not sent and not dry_run:
+        errors = "\n".join(f"- {s.key}: {s.error}" for s in total.subscores if s.error)
+        send_error(token, error_chat_id,
+                   f"Some data sources failed (scored as 0):\n{errors}")
+
+    update_state(state, today=today_utc, score=total.total, level=total.level, notified=sent)
 
     state.save(STATE_PATH)
     logger.info("state saved to %s", STATE_PATH)
