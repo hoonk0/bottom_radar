@@ -288,7 +288,7 @@ def main() -> int:
     except Exception:
         logger.exception("setMyCommands failed (continuing)")
     try:
-        send(token, chat_id, "🤖 _bottom\\_radar bot 가동_\n`/help` 로 명령어 확인", "Markdown")
+        send(token, chat_id, "🤖 bottom\\_radar bot 가동\n`/help` 로 명령어 확인", "Markdown")
     except Exception:
         logger.exception("startup ping failed (continuing)")
 
