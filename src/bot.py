@@ -50,9 +50,9 @@ from src.analysis import (
     INDICATOR_ALIASES,
     LABEL,
 )
-from src.indicators.score import LEVEL_EMOJI
 from src.logger import get_logger
 from src.pipeline import run_pipeline
+from src.telegram import format_status
 
 logger = get_logger("bot")
 KST = ZoneInfo("Asia/Seoul")
@@ -263,27 +263,8 @@ def cmd_status(_args) -> str:
         logger.exception("status pipeline failed")
         return f"⚠️ 파이프라인 에러: {e}"
 
-    total = result.total
     now = datetime.now(KST).strftime("%Y-%m-%d %H:%M KST")
-    lines = [
-        f"📊 *현재 점수* — _{now}_",
-        "",
-        f"*합산: {total.total} / 15  ({total.level.upper()})*",
-        "",
-    ]
-    for s in total.subscores:
-        emoji = LEVEL_EMOJI.get(s.level, "⚪")
-        if s.error:
-            lines.append(f"⚠️ {s.label}: 조회 실패")
-        else:
-            lines.append(f"{emoji} {s.label}: {s.display} (+{s.score})")
-
-    if result.snapshots:
-        lines.append("")
-        for snap in result.snapshots:
-            arrow = "📈" if snap.daily_change_pct >= 0 else "📉"
-            lines.append(f"{arrow} {snap.ticker}: ${snap.price:.2f} ({snap.daily_change_pct:+.2f}%)")
-    return "\n".join(lines)
+    return format_status(f"📊 *현재 점수* — _{now}_", result.total, result.snapshots)
 
 
 def cmd_year(args: list[str]) -> str:

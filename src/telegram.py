@@ -107,6 +107,29 @@ def format_message(
     return "\n".join(lines)
 
 
+def format_status(title: str, total: TotalScore, snapshots: Optional[List[Snapshot]] = None) -> str:
+    """Current-score summary used by /status and the scheduled briefing."""
+    lines = [
+        title,
+        "",
+        f"*합산: {total.total} / {MAX_SCORE}  "
+        f"{LEVEL_EMOJI[total.level]} {LEVEL_LABEL_KO[total.level]}({total.level.upper()})*",
+        "",
+    ]
+    for s in total.subscores:
+        if s.error:
+            lines.append(f"⚠️ {s.label}: 조회 실패")
+        else:
+            lines.append(f"{LEVEL_EMOJI.get(s.level, '⚪')} {s.label}: {s.display} (+{s.score})")
+
+    if snapshots:
+        lines.append("")
+        for snap in snapshots:
+            arrow = "📈" if snap.daily_change_pct >= 0 else "📉"
+            lines.append(f"{arrow} {snap.ticker}: ${snap.price:.2f} ({snap.daily_change_pct:+.2f}%)")
+    return "\n".join(lines)
+
+
 def send_telegram(
     token: str,
     chat_id: str,

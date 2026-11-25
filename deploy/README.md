@@ -8,6 +8,18 @@
 0 7 * * *   cd /home/kyunghoon/bottom_radar && set -a && . ./.env && set +a && /home/kyunghoon/bottom_radar/.venv/bin/python -m src.main >> /home/kyunghoon/bottom_radar/cron.log 2>&1
 ```
 
+## 1-1. 지표 브리핑 (하루 2번, 점수와 상관없이 현황 공지)
+
+08:00 KST(미국장 마감 기준)와 23:30 KST(미국장 장중 기준)에 현재 5지표 점수를 보냄.
+받는 곳은 `.env` 의 `TELEGRAM_BRIEF_CHAT_ID` (없으면 `TELEGRAM_CHAT_ID`). 쉼표로 여러 곳 가능.
+
+```
+0 8 * * 2-6   cd /home/kyunghoon/bottom_radar && set -a && . ./.env && set +a && /home/kyunghoon/bottom_radar/.venv/bin/python -m src.briefing >> /home/kyunghoon/bottom_radar/briefing.log 2>&1
+30 23 * * 1-5 cd /home/kyunghoon/bottom_radar && set -a && . ./.env && set +a && /home/kyunghoon/bottom_radar/.venv/bin/python -m src.briefing >> /home/kyunghoon/bottom_radar/briefing.log 2>&1
+```
+
+아침은 화~토(미국 월~금 마감 결과), 밤은 월~금(미국장 개장일)만 실행.
+
 ## 2. 인터랙티브 봇 (systemd 서비스 — 신규)
 
 24시간 떠있으면서 텔레그램의 `/help`, `/year`, `/indicator`, `/status` 명령 처리.
